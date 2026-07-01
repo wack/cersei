@@ -302,6 +302,10 @@ fn parse_sse_event(raw: &str) -> Option<StreamEvent> {
                     index,
                     thinking: delta["thinking"].as_str().unwrap_or("").to_string(),
                 }),
+                "signature_delta" => Some(StreamEvent::SignatureDelta {
+                    index,
+                    signature: delta["signature"].as_str().unwrap_or("").to_string(),
+                }),
                 _ => None,
             }
         }
@@ -424,5 +428,24 @@ mod tests {
         // https://github.com/pacifio/cersei/issues/20.
         assert!(!ANTHROPIC_BETA_HEADER.contains("interleaved-thinking-2025-04-14"));
         assert_eq!(ANTHROPIC_BETA_HEADER, "token-efficient-tools-2025-02-19");
+    }
+
+    #[test]
+    fn signature_delta_is_parsed_instead_of_dropped() {
+        // Anthropic streams a thinking block's signature as a
+        // `signature_delta` content_block_delta. Previously this fell
+        // through to the `_ => None` arm and was silently discarded, so
+        // the thinking block's signature stayed empty and the API
+        // rejected the next turn with HTTP 400. See
+        // https://github.com/pacifio/cersei/issues/21.
+        let raw = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-xyz\"}}";
+        let event = parse_sse_event(raw).expect("signature_delta should produce a StreamEvent");
+        match event {
+            StreamEvent::SignatureDelta { index, signature } => {
+                assert_eq!(index, 0);
+                assert_eq!(signature, "sig-xyz");
+            }
+            other => panic!("expected SignatureDelta, got {other:?}"),
+        }
     }
 }

@@ -317,6 +317,10 @@ pub enum StreamEvent {
         index: usize,
         thinking: String,
     },
+    SignatureDelta {
+        index: usize,
+        signature: String,
+    },
     ContentBlockStop {
         index: usize,
     },

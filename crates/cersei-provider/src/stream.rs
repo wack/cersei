@@ -9,6 +9,7 @@ pub struct StreamAccumulator {
     partial_text: HashMap<usize, String>,
     partial_json: HashMap<usize, String>,
     partial_thinking: HashMap<usize, String>,
+    partial_signature: HashMap<usize, String>,
     block_types: HashMap<usize, String>,
     tool_use_ids: HashMap<usize, String>,
     tool_use_names: HashMap<usize, String>,
@@ -25,6 +26,7 @@ impl StreamAccumulator {
             partial_text: HashMap::new(),
             partial_json: HashMap::new(),
             partial_thinking: HashMap::new(),
+            partial_signature: HashMap::new(),
             block_types: HashMap::new(),
             tool_use_ids: HashMap::new(),
             tool_use_names: HashMap::new(),
@@ -73,6 +75,12 @@ impl StreamAccumulator {
                     .or_default()
                     .push_str(&thinking);
             }
+            StreamEvent::SignatureDelta { index, signature } => {
+                self.partial_signature
+                    .entry(index)
+                    .or_default()
+                    .push_str(&signature);
+            }
             StreamEvent::ContentBlockStop { index } => {
                 let block_type = self.block_types.get(&index).cloned().unwrap_or_default();
                 let block = match block_type.as_str() {
@@ -91,7 +99,7 @@ impl StreamAccumulator {
                     }
                     "thinking" => ContentBlock::Thinking {
                         thinking: self.partial_thinking.remove(&index).unwrap_or_default(),
-                        signature: String::new(),
+                        signature: self.partial_signature.remove(&index).unwrap_or_default(),
                     },
                     _ => ContentBlock::Text {
                         text: self.partial_text.remove(&index).unwrap_or_default(),
@@ -152,5 +160,48 @@ impl StreamAccumulator {
 impl Default for StreamAccumulator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_block_carries_signature_from_signature_delta() {
+        // Anthropic streams a thinking block's signature as a separate
+        // signature_delta event. If it isn't accumulated onto the
+        // ContentBlock::Thinking, the block round-trips with an empty
+        // signature and the API rejects the next turn with HTTP 400. See
+        // https://github.com/pacifio/cersei/issues/21.
+        let mut acc = StreamAccumulator::new();
+        acc.process_event(StreamEvent::ContentBlockStart {
+            index: 0,
+            block_type: "thinking".to_string(),
+            id: None,
+            name: None,
+        });
+        acc.process_event(StreamEvent::ThinkingDelta {
+            index: 0,
+            thinking: "let me think...".to_string(),
+        });
+        acc.process_event(StreamEvent::SignatureDelta {
+            index: 0,
+            signature: "sig-abc".to_string(),
+        });
+        acc.process_event(StreamEvent::ContentBlockStop { index: 0 });
+
+        let response = acc.into_response().unwrap();
+        let blocks = match response.message.content {
+            MessageContent::Blocks(blocks) => blocks,
+            _ => panic!("expected block content"),
+        };
+        match &blocks[0] {
+            ContentBlock::Thinking { thinking, signature } => {
+                assert_eq!(thinking, "let me think...");
+                assert_eq!(signature, "sig-abc");
+            }
+            other => panic!("expected Thinking block, got {other:?}"),
+        }
     }
 }
