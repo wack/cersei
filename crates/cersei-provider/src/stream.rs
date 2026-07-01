@@ -10,6 +10,7 @@ pub struct StreamAccumulator {
     partial_json: HashMap<usize, String>,
     partial_thinking: HashMap<usize, String>,
     partial_signature: HashMap<usize, String>,
+    redacted_thinking_data: HashMap<usize, String>,
     block_types: HashMap<usize, String>,
     tool_use_ids: HashMap<usize, String>,
     tool_use_names: HashMap<usize, String>,
@@ -27,6 +28,7 @@ impl StreamAccumulator {
             partial_json: HashMap::new(),
             partial_thinking: HashMap::new(),
             partial_signature: HashMap::new(),
+            redacted_thinking_data: HashMap::new(),
             block_types: HashMap::new(),
             tool_use_ids: HashMap::new(),
             tool_use_names: HashMap::new(),
@@ -81,6 +83,10 @@ impl StreamAccumulator {
                     .or_default()
                     .push_str(&signature);
             }
+            StreamEvent::RedactedThinking { index, data } => {
+                self.redacted_thinking_data.insert(index, data);
+                self.block_types.insert(index, "redacted_thinking".to_string());
+            }
             StreamEvent::ContentBlockStop { index } => {
                 let block_type = self.block_types.get(&index).cloned().unwrap_or_default();
                 let block = match block_type.as_str() {
@@ -100,6 +106,9 @@ impl StreamAccumulator {
                     "thinking" => ContentBlock::Thinking {
                         thinking: self.partial_thinking.remove(&index).unwrap_or_default(),
                         signature: self.partial_signature.remove(&index).unwrap_or_default(),
+                    },
+                    "redacted_thinking" => ContentBlock::RedactedThinking {
+                        data: self.redacted_thinking_data.remove(&index).unwrap_or_default(),
                     },
                     _ => ContentBlock::Text {
                         text: self.partial_text.remove(&index).unwrap_or_default(),
@@ -202,6 +211,35 @@ mod tests {
                 assert_eq!(signature, "sig-abc");
             }
             other => panic!("expected Thinking block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redacted_thinking_block_preserves_opaque_data() {
+        // redacted_thinking arrives fully formed via a single
+        // RedactedThinking event (no ContentBlockStart, no deltas), but
+        // the API still sends a matching ContentBlockStop. Previously
+        // this block_type wasn't in the ContentBlockStop match, so it
+        // fell into the wildcard arm and became an empty Text block,
+        // losing the data that must round-trip unchanged. See
+        // https://github.com/pacifio/cersei/issues/21.
+        let mut acc = StreamAccumulator::new();
+        acc.process_event(StreamEvent::RedactedThinking {
+            index: 0,
+            data: "opaque-blob".to_string(),
+        });
+        acc.process_event(StreamEvent::ContentBlockStop { index: 0 });
+
+        let response = acc.into_response().unwrap();
+        let blocks = match response.message.content {
+            MessageContent::Blocks(blocks) => blocks,
+            _ => panic!("expected block content"),
+        };
+        match &blocks[0] {
+            ContentBlock::RedactedThinking { data } => {
+                assert_eq!(data, "opaque-blob");
+            }
+            other => panic!("expected RedactedThinking block, got {other:?}"),
         }
     }
 }

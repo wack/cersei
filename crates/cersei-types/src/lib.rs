@@ -321,6 +321,13 @@ pub enum StreamEvent {
         index: usize,
         signature: String,
     },
+    /// A `redacted_thinking` block. Unlike `thinking`, this arrives fully
+    /// formed (no deltas) — the opaque `data` must be echoed back
+    /// unmodified on subsequent requests.
+    RedactedThinking {
+        index: usize,
+        data: String,
+    },
     ContentBlockStop {
         index: usize,
     },

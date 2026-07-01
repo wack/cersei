@@ -274,15 +274,20 @@ fn parse_sse_event(raw: &str) -> Option<StreamEvent> {
         }
         "content_block_start" => {
             let index = json["index"].as_u64().unwrap_or(0) as usize;
-            let block_type = json["content_block"]["type"]
-                .as_str()
-                .unwrap_or("text")
-                .to_string();
+            let content_block = &json["content_block"];
+            let block_type = content_block["type"].as_str().unwrap_or("text").to_string();
+            if block_type == "redacted_thinking" {
+                // Delivered fully formed — no content_block_delta events follow.
+                return Some(StreamEvent::RedactedThinking {
+                    index,
+                    data: content_block["data"].as_str().unwrap_or("").to_string(),
+                });
+            }
             Some(StreamEvent::ContentBlockStart {
                 index,
                 block_type,
-                id: json["content_block"]["id"].as_str().map(String::from),
-                name: json["content_block"]["name"].as_str().map(String::from),
+                id: content_block["id"].as_str().map(String::from),
+                name: content_block["name"].as_str().map(String::from),
             })
         }
         "content_block_delta" => {
@@ -446,6 +451,25 @@ mod tests {
                 assert_eq!(signature, "sig-xyz");
             }
             other => panic!("expected SignatureDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redacted_thinking_block_start_is_parsed_instead_of_dropped() {
+        // A redacted_thinking block arrives fully formed in
+        // content_block_start (no deltas follow). Previously the parser
+        // only read `id`/`name` off content_block, so the opaque `data`
+        // was discarded and the block silently became an empty text
+        // block downstream. See
+        // https://github.com/pacifio/cersei/issues/21.
+        let raw = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-blob\"}}";
+        let event = parse_sse_event(raw).expect("redacted_thinking start should produce a StreamEvent");
+        match event {
+            StreamEvent::RedactedThinking { index, data } => {
+                assert_eq!(index, 2);
+                assert_eq!(data, "opaque-blob");
+            }
+            other => panic!("expected RedactedThinking, got {other:?}"),
         }
     }
 }
