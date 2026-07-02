@@ -4,9 +4,18 @@
 //! library crates (`ignore` for the gitignore-aware parallel directory walker
 //! and `grep` for the regex matcher/searcher). It needs no external `rg`/`grep`
 //! binary, so behavior is identical on every machine.
+//!
+//! `glob` walks with the same `ignore` crate (gitignore-aware, hidden-skipping,
+//! parallel, no symlink-following) and matches names with `globset`. It stops
+//! the walk the moment `max_results` is reached and aborts with
+//! [`SearchError::Timeout`] when its `deadline` expires — an unbounded pattern
+//! over a huge tree (`**/*.rs` from `/`) returns an error the caller can react
+//! to instead of pinning a blocking thread for minutes.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// A single search match with context.
 #[derive(Debug, Clone)]
@@ -35,12 +44,34 @@ pub struct GrepOptions {
     pub hidden: bool,
 }
 
+/// Options for glob.
+///
+/// Defaults mirror [`GrepOptions`]: gitignore/`.ignore` rules are respected and
+/// hidden files are skipped, so a recursive pattern doesn't drown in `target/`,
+/// `node_modules/`, or `.git/`.
+#[derive(Debug, Clone, Default)]
+pub struct GlobOptions {
+    /// Cap on the number of paths returned; the walk stops as soon as it is
+    /// reached. `None` is unlimited.
+    pub max_results: Option<usize>,
+    /// Wall-clock budget for the walk. On expiry the walk stops and
+    /// [`SearchError::Timeout`] is returned. `None` is unlimited.
+    pub deadline: Option<Duration>,
+    /// When `true`, ignore `.gitignore`/`.ignore`/hidden filtering (walk everything).
+    pub no_ignore: bool,
+    /// When `true`, include hidden files/directories. Also enabled implicitly
+    /// when the pattern itself names a dot-component (e.g. `.github/**`).
+    pub hidden: bool,
+}
+
 /// Search errors.
 #[derive(Debug)]
 pub enum SearchError {
     InvalidPattern(String),
     IoError(std::io::Error),
     CommandFailed(String),
+    /// The walk exceeded its wall-clock budget before finishing.
+    Timeout(Duration),
 }
 
 impl std::fmt::Display for SearchError {
@@ -49,6 +80,7 @@ impl std::fmt::Display for SearchError {
             Self::InvalidPattern(p) => write!(f, "invalid pattern: {p}"),
             Self::IoError(e) => write!(f, "I/O error: {e}"),
             Self::CommandFailed(msg) => write!(f, "command failed: {msg}"),
+            Self::Timeout(budget) => write!(f, "timed out after {budget:?}"),
         }
     }
 }
@@ -187,24 +219,139 @@ fn grep_blocking(
 }
 
 /// Find files matching a glob pattern.
-pub async fn glob(pattern: &str, base_dir: &Path) -> Result<Vec<PathBuf>, SearchError> {
-    let full_pattern = base_dir.join(pattern).display().to_string();
+///
+/// `pattern` is joined onto `base_dir` (an absolute pattern replaces the base,
+/// matching `Path::join`). The walk is gitignore-aware, skips hidden files by
+/// default (see [`GlobOptions`]), never follows symlinks (so a link cycle
+/// cannot make it unbounded), stops at `max_results`, and aborts with
+/// [`SearchError::Timeout`] when `deadline` expires. Results are sorted; with
+/// `max_results` set, *which* matches are returned is nondeterministic (the
+/// parallel walk quits early), but the output order is stable.
+pub async fn glob(
+    pattern: &str,
+    base_dir: &Path,
+    opts: GlobOptions,
+) -> Result<Vec<PathBuf>, SearchError> {
+    let pattern = pattern.to_string();
+    let base_dir = base_dir.to_path_buf();
 
-    // glob::glob is synchronous — run on blocking thread
-    let paths = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>, SearchError> {
-        let mut results = Vec::new();
-        for path in
-            ::glob::glob(&full_pattern).map_err(|e| SearchError::InvalidPattern(e.to_string()))?
-            .flatten()
-        {
-            results.push(path);
-        }
-        Ok(results)
-    })
-    .await
-    .map_err(|e| SearchError::CommandFailed(e.to_string()))??;
+    tokio::task::spawn_blocking(move || glob_blocking(&pattern, &base_dir, opts))
+        .await
+        .map_err(|e| SearchError::CommandFailed(e.to_string()))?
+}
+
+/// Synchronous core of [`glob`], intended to run on a blocking thread.
+fn glob_blocking(
+    pattern: &str,
+    base_dir: &Path,
+    opts: GlobOptions,
+) -> Result<Vec<PathBuf>, SearchError> {
+    use ignore::{WalkBuilder, WalkState};
+
+    let full_pattern = base_dir.join(pattern);
+    // `literal_separator` gives the glob crate's semantics this replaced:
+    // `*`/`?` do not cross `/`, only `**` recurses.
+    let matcher = globset::GlobBuilder::new(&full_pattern.display().to_string())
+        .literal_separator(true)
+        .build()
+        .map_err(|e| SearchError::InvalidPattern(e.to_string()))?
+        .compile_matcher();
+
+    // Walk from the pattern's literal prefix (the components before the first
+    // metacharacter), not from `base_dir`: for an absolute pattern the two are
+    // unrelated, and for `src/**` it avoids walking siblings only to discard them.
+    let walk_root = literal_prefix(&full_pattern);
+    if !walk_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    // A pattern that names a dot-component (`.github/**`) is an explicit ask
+    // for hidden files — honor it without requiring the `hidden` opt-in.
+    let want_hidden = opts.hidden
+        || Path::new(pattern).components().any(|c| {
+            matches!(c, Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+        });
+
+    let mut builder = WalkBuilder::new(&walk_root);
+    if opts.no_ignore {
+        builder.standard_filters(false);
+    } else {
+        // Honor .gitignore even when the walk root isn't inside a git repo,
+        // mirroring `grep_blocking`.
+        builder.require_git(false);
+    }
+    builder.hidden(!want_hidden);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    builder.threads(threads);
+
+    let results: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    let max = opts.max_results;
+    let deadline = opts.deadline;
+
+    builder.build_parallel().run(|| {
+        let matcher = matcher.clone();
+        let results = Arc::clone(&results);
+        let timed_out = Arc::clone(&timed_out);
+
+        Box::new(move |entry| {
+            if deadline.is_some_and(|budget| started.elapsed() > budget) {
+                timed_out.store(true, Ordering::Relaxed);
+                return WalkState::Quit;
+            }
+            let Ok(entry) = entry else {
+                return WalkState::Continue;
+            };
+            if !matcher.is_match(entry.path()) {
+                return WalkState::Continue;
+            }
+
+            let mut guard = results.lock().unwrap();
+            guard.push(entry.into_path());
+            if max.is_some_and(|max| guard.len() >= max) {
+                return WalkState::Quit;
+            }
+            WalkState::Continue
+        })
+    });
+
+    if timed_out.load(Ordering::Relaxed) {
+        return Err(SearchError::Timeout(
+            deadline.unwrap_or_else(|| started.elapsed()),
+        ));
+    }
+
+    let mut paths = Arc::try_unwrap(results)
+        .map(|m| m.into_inner().unwrap())
+        .unwrap_or_else(|arc| arc.lock().unwrap().clone());
+
+    // Parallel walk order is nondeterministic — sort for stable output.
+    paths.sort();
+    if let Some(max) = max {
+        paths.truncate(max);
+    }
 
     Ok(paths)
+}
+
+/// The leading components of a glob pattern before the first one containing a
+/// metacharacter — the directory the walk actually needs to start from.
+fn literal_prefix(pattern: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in pattern.components() {
+        if component
+            .as_os_str()
+            .to_string_lossy()
+            .contains(['*', '?', '[', '{'])
+        {
+            break;
+        }
+        out.push(component.as_os_str());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -213,10 +360,162 @@ mod tests {
     use std::fs;
 
     #[tokio::test]
-    async fn test_glob_basic() {
-        let results = glob("*.toml", Path::new(".")).await.unwrap();
-        // Should find at least Cargo.toml in the workspace
-        assert!(!results.is_empty() || true); // may not find from test cwd
+    async fn glob_finds_nested_files_recursively() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("src/deep")).unwrap();
+        fs::write(tmp.path().join("top.rs"), "").unwrap();
+        fs::write(tmp.path().join("src/mid.rs"), "").unwrap();
+        fs::write(tmp.path().join("src/deep/low.rs"), "").unwrap();
+        fs::write(tmp.path().join("src/readme.md"), "").unwrap();
+
+        let paths = glob("**/*.rs", tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 3);
+        // Sorted, absolute paths.
+        assert!(paths.windows(2).all(|w| w[0] <= w[1]));
+        assert!(paths.iter().all(|p| p.is_absolute()));
+    }
+
+    #[tokio::test]
+    async fn glob_star_does_not_cross_separators() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("top.rs"), "").unwrap();
+        fs::write(tmp.path().join("sub/nested.rs"), "").unwrap();
+
+        let paths = glob("*.rs", tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("top.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_respects_gitignore_unless_opted_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("target")).unwrap();
+        fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        fs::write(tmp.path().join("kept.rs"), "").unwrap();
+        fs::write(tmp.path().join("target/generated.rs"), "").unwrap();
+
+        let paths = glob("**/*.rs", tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("kept.rs"));
+
+        let opts = GlobOptions {
+            no_ignore: true,
+            ..Default::default()
+        };
+        let paths = glob("**/*.rs", tmp.path(), opts).await.unwrap();
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn glob_skips_hidden_unless_asked_or_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".github/workflows")).unwrap();
+        fs::write(tmp.path().join("visible.yml"), "").unwrap();
+        fs::write(tmp.path().join(".github/workflows/ci.yml"), "").unwrap();
+
+        // Hidden skipped by default.
+        let paths = glob("**/*.yml", tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("visible.yml"));
+
+        // Explicit opt-in includes it.
+        let opts = GlobOptions {
+            hidden: true,
+            ..Default::default()
+        };
+        assert_eq!(glob("**/*.yml", tmp.path(), opts).await.unwrap().len(), 2);
+
+        // A pattern that names the dot-component is an implicit opt-in.
+        let paths = glob(".github/**/*.yml", tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("ci.yml"));
+    }
+
+    #[tokio::test]
+    async fn glob_stops_at_max_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            fs::write(tmp.path().join(format!("f{i:02}.rs")), "").unwrap();
+        }
+        let opts = GlobOptions {
+            max_results: Some(10),
+            ..Default::default()
+        };
+        let paths = glob("*.rs", tmp.path(), opts).await.unwrap();
+        assert_eq!(paths.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn glob_expired_deadline_is_a_timeout_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), "").unwrap();
+        let opts = GlobOptions {
+            deadline: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let r = glob("**/*.rs", tmp.path(), opts).await;
+        assert!(matches!(r, Err(SearchError::Timeout(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_does_not_follow_symlink_cycles() {
+        // The `glob` crate this replaced followed directory symlinks with no
+        // cycle detection, so a self-referential link made `**` unbounded.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("real.rs"), "").unwrap();
+        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
+
+        let paths = glob("**/*.rs", tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("real.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_absolute_pattern_replaces_the_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::write(elsewhere.path().join("found.rs"), "").unwrap();
+
+        let pattern = format!("{}/*.rs", elsewhere.path().display());
+        let paths = glob(&pattern, tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("found.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_nonexistent_root_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = glob("no/such/dir/**/*.rs", tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert!(paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn glob_literal_pattern_matches_a_single_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        let paths = glob("Cargo.toml", tmp.path(), GlobOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("Cargo.toml"));
     }
 
     #[tokio::test]

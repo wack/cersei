@@ -46,6 +46,7 @@ tantivy = "0.22"
 cersei-embeddings = { workspace = true }
 cersei-vms = { workspace = true, optional = true }
 ignore = { workspace = true }
+globset = { workspace = true }
 grep = { workspace = true }
 
 [features]
