@@ -224,9 +224,9 @@ pub(crate) fn spawn_sse(client: reqwest::Client, request: reqwest::Request) -> C
                     match chunk {
                         Ok(bytes) => {
                             buffer.push_str(&String::from_utf8_lossy(&bytes));
-                            while let Some(pos) = buffer.find("\n\n") {
-                                let event_str = buffer[..pos].to_string();
-                                buffer = buffer[pos + 2..].to_string();
+                            while let Some((event_end, rest_start)) = find_event_boundary(&buffer) {
+                                let event_str = buffer[..event_end].to_string();
+                                buffer = buffer[rest_start..].to_string();
                                 if let Some(event) = parse_sse_event(&event_str) {
                                     if tx.send(event).await.is_err() {
                                         return;
@@ -260,6 +260,40 @@ pub(crate) fn spawn_sse(client: reqwest::Client, request: reqwest::Request) -> C
 }
 
 // ─── SSE parser ──────────────────────────────────────────────────────────────
+
+/// Byte length of the line terminator at `bytes[i]`, if any. The SSE spec
+/// allows `\r\n`, `\n`, or `\r`.
+fn line_terminator_len(bytes: &[u8], i: usize) -> Option<usize> {
+    match bytes.get(i)? {
+        b'\n' => Some(1),
+        b'\r' => Some(if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 }),
+        _ => None,
+    }
+}
+
+/// Find the first SSE event boundary — a blank line, i.e. two consecutive
+/// line terminators — returning `(event_end, rest_start)`.
+///
+/// Anthropic itself frames with `\n\n`, but compatible gateways may emit
+/// CRLF (`\r\n\r\n`), which a bare `find("\n\n")` never matches — the parser
+/// would buffer the whole stream and the turn would sit silent until an
+/// outer timeout killed it. (A `\r\n` split across two chunks can surface
+/// the trailing `\n` as a leading blank line of the next event; the
+/// line-based parser ignores blank lines, so that's harmless.)
+fn find_event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let bytes = buffer.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match line_terminator_len(bytes, i) {
+            Some(first) => match line_terminator_len(bytes, i + first) {
+                Some(second) => return Some((i, i + first + second)),
+                None => i += first,
+            },
+            None => i += 1,
+        }
+    }
+    None
+}
 
 fn parse_sse_event(raw: &str) -> Option<StreamEvent> {
     let mut event_type = String::new();
@@ -464,6 +498,38 @@ mod tests {
             }
             other => panic!("expected SignatureDelta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn event_boundary_handles_lf_and_crlf_framing() {
+        // Anthropic's own LF framing.
+        let lf = "event: ping\ndata: {}\n\nrest";
+        let (end, rest) = find_event_boundary(lf).expect("LF boundary");
+        assert_eq!(&lf[..end], "event: ping\ndata: {}");
+        assert_eq!(&lf[rest..], "rest");
+
+        // CRLF framing from Anthropic-compatible gateways: `find("\n\n")`
+        // never matched this, so the stream buffered forever.
+        let crlf = "event: ping\r\ndata: {}\r\n\r\nrest";
+        let (end, rest) = find_event_boundary(crlf).expect("CRLF boundary");
+        assert_eq!(&crlf[..end], "event: ping\r\ndata: {}");
+        assert_eq!(&crlf[rest..], "rest");
+
+        // An incomplete event must keep buffering, not split early.
+        assert_eq!(find_event_boundary("event: ping\r\ndata: {}\r\n"), None);
+        assert_eq!(find_event_boundary("event: ping\ndata: {}"), None);
+    }
+
+    #[test]
+    fn crlf_terminated_event_lines_still_parse() {
+        // Once framed, a CRLF event's lines reach the parser with `\r\n`
+        // separators; `str::lines()` strips the `\r`, so field extraction
+        // must be unaffected.
+        let raw = "event: message_stop\r\ndata: {\"type\":\"message_stop\"}";
+        assert!(matches!(
+            parse_sse_event(raw),
+            Some(StreamEvent::MessageStop)
+        ));
     }
 
     #[test]

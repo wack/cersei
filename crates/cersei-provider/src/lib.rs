@@ -32,11 +32,20 @@ pub use stream::StreamAccumulator;
 /// connect should fail (and get retried) in seconds, not stall an agent turn.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Build the HTTP client shared by the providers: bounded connect, no
-/// total-request timeout (streams are long-lived).
+/// Idle-read timeout for provider HTTP clients. Unlike a total-request
+/// timeout (which would kill legitimately long streams), this bounds the gap
+/// between successive reads: healthy SSE streams deliver deltas or pings far
+/// more often than this, so two minutes of silence means a dead connection.
+/// It must surface as a retryable transport error, not hang the turn until
+/// some outer wall-clock kill.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Build the HTTP client shared by the providers: bounded connect and
+/// per-read idle timeouts, no total-request timeout (streams are long-lived).
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
         // Building only fails if the TLS backend cannot initialize; fall back
         // to the default client rather than panicking.

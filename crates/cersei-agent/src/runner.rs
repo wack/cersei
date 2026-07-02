@@ -43,6 +43,15 @@ async fn retry_backoff(
         err,
         actual_delay
     );
+    // Synchronous `emit` observers fire before the channel send everywhere in
+    // this file: the send can park on backpressure, and an event that reached
+    // the stream but never the observers is invisible to trace recorders.
+    agent.emit(AgentEvent::Status(format!(
+        "Retrying in {:.1}s ({}/{})",
+        actual_delay as f64 / 1000.0,
+        retry_count,
+        max_retries
+    )));
     let _ = event_tx
         .send(AgentEvent::Status(format!(
             "Provider error. Retrying in {:.1}s... ({}/{})",
@@ -51,12 +60,6 @@ async fn retry_backoff(
             max_retries
         )))
         .await;
-    agent.emit(AgentEvent::Status(format!(
-        "Retrying in {:.1}s ({}/{})",
-        actual_delay as f64 / 1000.0,
-        retry_count,
-        max_retries
-    )));
     tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
 }
 
@@ -180,8 +183,16 @@ pub fn apply_tool_result_budget(messages: &mut [Message], budget_chars: usize) {
 
 /// Run the agent without streaming (blocking until complete).
 pub async fn run_agent(agent: &Agent, prompt: &str) -> Result<AgentOutput> {
-    let (event_tx, _event_rx) = mpsc::channel(512);
+    let (event_tx, mut event_rx) = mpsc::channel(512);
     let (_control_tx, control_rx) = mpsc::channel(64);
+
+    // This path has no stream consumer, but the loop still `send().await`s
+    // every event into the bounded channel. Drain it concurrently: holding an
+    // unread receiver alive deadlocked any run past 512 events — the sender
+    // parked forever mid-turn (observers only get events via `Agent::emit`,
+    // which is independent of this channel). The drain task exits on its own
+    // once the run returns and the last sender is dropped.
+    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
     let prompt = prompt.to_string();
 
@@ -214,16 +225,16 @@ pub async fn run_agent_streaming(
             if !history.is_empty() {
                 let count = history.len();
                 agent.messages.lock().extend(history);
+                agent.emit(AgentEvent::SessionLoaded {
+                    session_id: session_id.clone(),
+                    message_count: count,
+                });
                 let _ = event_tx
                     .send(AgentEvent::SessionLoaded {
                         session_id: session_id.clone(),
                         message_count: count,
                     })
                     .await;
-                agent.emit(AgentEvent::SessionLoaded {
-                    session_id: session_id.clone(),
-                    message_count: count,
-                });
             }
         }
     } // end session load guard
@@ -291,8 +302,8 @@ pub async fn run_agent_streaming(
             return Err(CerseiError::Cancelled);
         }
 
-        let _ = event_tx.send(AgentEvent::TurnStart { turn }).await;
         agent.emit(AgentEvent::TurnStart { turn });
+        let _ = event_tx.send(AgentEvent::TurnStart { turn }).await;
 
         // Apply tool result budget to keep context manageable
         {
@@ -393,14 +404,14 @@ pub async fn run_agent_streaming(
                             Some(event) => {
                                 match &event {
                                     StreamEvent::TextDelta { text, .. } => {
-                                        let _ = event_tx.send(AgentEvent::TextDelta(text.clone())).await;
                                         agent.emit(AgentEvent::TextDelta(text.clone()));
+                                        let _ = event_tx.send(AgentEvent::TextDelta(text.clone())).await;
                                     }
                                     StreamEvent::ThinkingDelta { thinking, .. } => {
+                                        agent.emit(AgentEvent::ThinkingDelta(thinking.clone()));
                                         let _ = event_tx
                                             .send(AgentEvent::ThinkingDelta(thinking.clone()))
                                             .await;
-                                        agent.emit(AgentEvent::ThinkingDelta(thinking.clone()));
                                     }
                                     StreamEvent::Error { message, kind } => {
                                         let err = kind.into_error(message.clone());
@@ -444,6 +455,12 @@ pub async fn run_agent_streaming(
 
         // Emit cost update
         let cumulative = agent.cumulative_usage.lock().clone();
+        agent.emit(AgentEvent::CostUpdate {
+            turn_cost: response.usage.cost_usd.unwrap_or(0.0),
+            cumulative_cost: cumulative.cost_usd.unwrap_or(0.0),
+            input_tokens: cumulative.input_tokens,
+            output_tokens: cumulative.output_tokens,
+        });
         let _ = event_tx
             .send(AgentEvent::CostUpdate {
                 turn_cost: response.usage.cost_usd.unwrap_or(0.0),
@@ -452,12 +469,6 @@ pub async fn run_agent_streaming(
                 output_tokens: cumulative.output_tokens,
             })
             .await;
-        agent.emit(AgentEvent::CostUpdate {
-            turn_cost: response.usage.cost_usd.unwrap_or(0.0),
-            cumulative_cost: cumulative.cost_usd.unwrap_or(0.0),
-            input_tokens: cumulative.input_tokens,
-            output_tokens: cumulative.output_tokens,
-        });
 
         // Add assistant message to history
         agent.messages.lock().push(response.message.clone());
@@ -499,6 +510,11 @@ pub async fn run_agent_streaming(
             let _ = cersei_hooks::run_hooks(&agent.hooks, &cadence_ctx).await;
         }
 
+        agent.emit(AgentEvent::TurnComplete {
+            turn,
+            stop_reason: response.stop_reason.clone(),
+            usage: response.usage.clone(),
+        });
         let _ = event_tx
             .send(AgentEvent::TurnComplete {
                 turn,
@@ -506,11 +522,6 @@ pub async fn run_agent_streaming(
                 usage: response.usage.clone(),
             })
             .await;
-        agent.emit(AgentEvent::TurnComplete {
-            turn,
-            stop_reason: response.stop_reason.clone(),
-            usage: response.usage.clone(),
-        });
 
         // Handle stop reason
         match &response.stop_reason {
@@ -649,6 +660,11 @@ pub async fn run_agent_streaming(
 
                 // Phase 1: Emit ToolStart events for all tools
                 for (tool_id, tool_name, tool_input) in &tool_use_blocks {
+                    agent.emit(AgentEvent::ToolStart {
+                        name: tool_name.clone(),
+                        id: tool_id.clone(),
+                        input: tool_input.clone(),
+                    });
                     let _ = event_tx
                         .send(AgentEvent::ToolStart {
                             name: tool_name.clone(),
@@ -656,11 +672,6 @@ pub async fn run_agent_streaming(
                             input: tool_input.clone(),
                         })
                         .await;
-                    agent.emit(AgentEvent::ToolStart {
-                        name: tool_name.clone(),
-                        id: tool_id.clone(),
-                        input: tool_input.clone(),
-                    });
                 }
 
                 // Phase 2: Execute all tools in PARALLEL via join_all
@@ -793,6 +804,14 @@ pub async fn run_agent_streaming(
                         (cap_tool_result(&compressed), Some(stats))
                     };
 
+                    agent.emit(AgentEvent::ToolEnd {
+                        name: tool_name.clone(),
+                        id: tool_id.clone(),
+                        result: result.content.clone(),
+                        is_error: result.is_error,
+                        duration,
+                        compression,
+                    });
                     let _ = event_tx
                         .send(AgentEvent::ToolEnd {
                             name: tool_name.clone(),
@@ -803,14 +822,6 @@ pub async fn run_agent_streaming(
                             compression,
                         })
                         .await;
-                    agent.emit(AgentEvent::ToolEnd {
-                        name: tool_name.clone(),
-                        id: tool_id.clone(),
-                        result: result.content.clone(),
-                        is_error: result.is_error,
-                        duration,
-                        compression,
-                    });
 
                     tool_calls.push(ToolCallRecord {
                         name: tool_name,
@@ -916,16 +927,16 @@ pub async fn run_agent_streaming(
                 } else {
                     WarningState::Warning
                 };
+                agent.emit(AgentEvent::TokenWarning {
+                    pct_used: pct,
+                    state,
+                });
                 let _ = event_tx
                     .send(AgentEvent::TokenWarning {
                         pct_used: pct,
                         state,
                     })
                     .await;
-                agent.emit(AgentEvent::TokenWarning {
-                    pct_used: pct,
-                    state,
-                });
             }
 
             // Auto-compact at 90%: try LLM summarization, fall back to snip
@@ -979,14 +990,14 @@ pub async fn run_agent_streaming(
     if let (Some(memory), Some(session_id)) = (&agent.memory, &agent.session_id) {
         let messages = agent.messages.lock().clone();
         memory.store(session_id, &messages).await?;
+        agent.emit(AgentEvent::SessionSaved {
+            session_id: session_id.clone(),
+        });
         let _ = event_tx
             .send(AgentEvent::SessionSaved {
                 session_id: session_id.clone(),
             })
             .await;
-        agent.emit(AgentEvent::SessionSaved {
-            session_id: session_id.clone(),
-        });
     }
 
     // Build output
@@ -1222,5 +1233,89 @@ mod tests {
         assert!(matches!(err, CerseiError::Transport(_)), "got: {err:?}");
         // The initial attempt plus five backoff re-issues.
         assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+
+    /// A provider that floods one turn with more stream deltas than the
+    /// blocking path's 512-slot event channel can hold.
+    struct TorrentProvider {
+        deltas: usize,
+    }
+
+    #[async_trait]
+    impl Provider for TorrentProvider {
+        fn name(&self) -> &str {
+            "torrent"
+        }
+        fn context_window(&self, _: &str) -> u64 {
+            200_000
+        }
+        fn capabilities(&self, _: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn complete(&self, _: CompletionRequest) -> cersei_types::Result<CompletionStream> {
+            let deltas = self.deltas;
+            let (tx, rx) = mpsc::channel(16);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(StreamEvent::MessageStart {
+                        id: "1".into(),
+                        model: "torrent".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        block_type: "text".into(),
+                        id: None,
+                        name: None,
+                    })
+                    .await;
+                for _ in 0..deltas {
+                    let _ = tx
+                        .send(StreamEvent::TextDelta {
+                            index: 0,
+                            text: "tok ".into(),
+                        })
+                        .await;
+                }
+                let _ = tx.send(StreamEvent::ContentBlockStop { index: 0 }).await;
+                let _ = tx
+                    .send(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Some(Usage::default()),
+                    })
+                    .await;
+                let _ = tx.send(StreamEvent::MessageStop).await;
+            });
+            Ok(CompletionStream::new(rx))
+        }
+    }
+
+    /// The blocking `run_agent` path has no stream consumer, and it used to
+    /// hold the bounded event channel's receiver alive without draining it:
+    /// any run past 512 events parked the loop forever on `send().await`
+    /// (the 2026-07-02 `multi check` postmortem — every GLM run froze
+    /// mid-turn at exactly the 512th event). Paused time makes the deadline
+    /// fire instantly if the loop deadlocks instead of completing.
+    #[tokio::test(start_paused = true)]
+    async fn blocking_run_survives_more_than_512_stream_events() {
+        let agent = Agent::builder()
+            .provider(TorrentProvider { deltas: 2_000 })
+            .max_turns(1)
+            .build()
+            .expect("agent builds");
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_agent(&agent, "go"),
+        )
+        .await
+        .expect("agentic loop deadlocked on its undrained event channel")
+        .expect("run succeeds");
+
+        assert_eq!(output.text(), "tok ".repeat(2_000));
     }
 }
