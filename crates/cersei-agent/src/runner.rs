@@ -324,6 +324,8 @@ pub async fn run_agent_streaming(
         let mut options = ProviderOptions::default();
         if let Some(budget) = agent.thinking_budget {
             options.set("thinking_budget", budget);
+        } else if agent.thinking_disabled {
+            options.set("thinking_disabled", true);
         }
 
         // Todo nudge: on turns > 2, remind model about incomplete todos

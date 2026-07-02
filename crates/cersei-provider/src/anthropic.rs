@@ -102,12 +102,9 @@ impl Provider for Anthropic {
             request.model.clone()
         };
 
-        let thinking_budget = request
-            .options
-            .get::<u32>("thinking_budget")
-            .or(self.thinking_budget);
+        let thinking = thinking_directive(&request, self.thinking_budget);
         // Direct Anthropic: include "model" in the body, no vertex version.
-        let body = build_anthropic_body(Some(&model), &request, thinking_budget, None);
+        let body = build_anthropic_body(Some(&model), &request, thinking, None);
 
         let url = format!("{}/v1/messages", self.base_url);
         let mut req_builder = self
@@ -127,6 +124,50 @@ impl Provider for Anthropic {
 
 // ─── Shared request/stream helpers (reused by the Vertex provider) ─────────────
 
+/// How the Messages-API `thinking` field is rendered. Three states, because
+/// "no field" and "explicitly off" are not the same request: Anthropic's own
+/// models treat an omitted field as thinking-off, but Anthropic-compatible
+/// gateways serving hybrid-reasoning models (e.g. Fireworks serving GLM) treat
+/// it as "model default" — which can mean reasoning ON. An explicit
+/// `{"type": "disabled"}` is the only reliable off switch there.
+///
+/// `Disabled` is opt-in rather than the no-budget default because some models
+/// reject an explicit disable (Claude Fable 5 400s on it; omitting the field
+/// is the only way to run it) — the caller knows its model, this layer doesn't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThinkingDirective {
+    /// No `thinking` field — the model's own default applies.
+    Omit,
+    /// `{"type": "disabled"}` — explicitly off.
+    Disabled,
+    /// `{"type": "enabled", "budget_tokens": n}`.
+    Budget(u32),
+}
+
+/// Resolve the thinking directive for one request: an explicit budget (from
+/// the request options or the provider default) wins; otherwise the request's
+/// `thinking_disabled` option selects an explicit disable; otherwise omit.
+pub(crate) fn thinking_directive(
+    request: &CompletionRequest,
+    default_budget: Option<u32>,
+) -> ThinkingDirective {
+    match request
+        .options
+        .get::<u32>("thinking_budget")
+        .or(default_budget)
+    {
+        Some(budget) => ThinkingDirective::Budget(budget),
+        None if request
+            .options
+            .get::<bool>("thinking_disabled")
+            .unwrap_or(false) =>
+        {
+            ThinkingDirective::Disabled
+        }
+        None => ThinkingDirective::Omit,
+    }
+}
+
 /// Build the Anthropic Messages request body.
 ///
 /// - `model`: `Some(model)` for direct Anthropic (adds the `model` field);
@@ -138,7 +179,7 @@ impl Provider for Anthropic {
 pub(crate) fn build_anthropic_body(
     model: Option<&str>,
     request: &CompletionRequest,
-    thinking_budget: Option<u32>,
+    thinking: ThinkingDirective,
     vertex_version: Option<&str>,
 ) -> serde_json::Value {
     let api_messages: Vec<serde_json::Value> = request
@@ -194,8 +235,15 @@ pub(crate) fn build_anthropic_body(
     if !request.stop_sequences.is_empty() {
         body["stop_sequences"] = serde_json::json!(request.stop_sequences);
     }
-    if let Some(budget) = thinking_budget {
-        body["thinking"] = serde_json::json!({ "type": "enabled", "budget_tokens": budget });
+    match thinking {
+        ThinkingDirective::Budget(budget) => {
+            body["thinking"] =
+                serde_json::json!({ "type": "enabled", "budget_tokens": budget });
+        }
+        ThinkingDirective::Disabled => {
+            body["thinking"] = serde_json::json!({ "type": "disabled" });
+        }
+        ThinkingDirective::Omit => {}
     }
     body
 }
@@ -498,6 +546,33 @@ mod tests {
             }
             other => panic!("expected SignatureDelta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn thinking_directive_renders_all_three_states() {
+        let mut request = CompletionRequest::new("m");
+
+        // No budget, no disable flag → the field is omitted entirely.
+        let directive = thinking_directive(&request, None);
+        assert_eq!(directive, ThinkingDirective::Omit);
+        let body = build_anthropic_body(Some("m"), &request, directive, None);
+        assert!(body.get("thinking").is_none());
+
+        // The opt-in flag renders an explicit disable — omission means "model
+        // default", which is reasoning-ON for gateway-served hybrid models.
+        request.options.set("thinking_disabled", true);
+        let directive = thinking_directive(&request, None);
+        assert_eq!(directive, ThinkingDirective::Disabled);
+        let body = build_anthropic_body(Some("m"), &request, directive, None);
+        assert_eq!(body["thinking"]["type"], "disabled");
+
+        // A budget always wins over the disable flag.
+        request.options.set("thinking_budget", 4096u32);
+        let directive = thinking_directive(&request, None);
+        assert_eq!(directive, ThinkingDirective::Budget(4096));
+        let body = build_anthropic_body(Some("m"), &request, directive, None);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
     }
 
     #[test]

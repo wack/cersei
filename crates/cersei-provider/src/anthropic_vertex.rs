@@ -12,7 +12,7 @@
 //! `gcp_auth`) — required for long runs since GCP tokens expire ~1h; a pre-minted
 //! `VERTEX_ACCESS_TOKEN`; or a local `gcloud auth print-access-token`.
 
-use crate::anthropic::{build_anthropic_body, spawn_sse};
+use crate::anthropic::{build_anthropic_body, spawn_sse, thinking_directive};
 use crate::*;
 use cersei_types::*;
 use std::sync::Arc;
@@ -155,13 +155,10 @@ impl Provider for AnthropicVertex {
         } else {
             request.model.clone()
         };
-        let thinking_budget = request
-            .options
-            .get::<u32>("thinking_budget")
-            .or(self.thinking_budget);
+        let thinking = thinking_directive(&request, self.thinking_budget);
 
         // Vertex: no `model` in body, add the vertex anthropic_version.
-        let body = build_anthropic_body(None, &request, thinking_budget, Some(VERTEX_VERSION));
+        let body = build_anthropic_body(None, &request, thinking, Some(VERTEX_VERSION));
 
         let token = self.bearer_token().await?;
         let http_request = self

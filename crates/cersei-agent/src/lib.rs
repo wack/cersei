@@ -75,6 +75,7 @@ pub struct Agent {
     max_tokens: u32,
     temperature: Option<f32>,
     thinking_budget: Option<u32>,
+    thinking_disabled: bool,
     working_dir: PathBuf,
     permission_policy: Arc<dyn PermissionPolicy>,
     memory: Option<Arc<dyn Memory>>,
@@ -217,6 +218,7 @@ pub struct AgentBuilder {
     max_tokens: u32,
     temperature: Option<f32>,
     thinking_budget: Option<u32>,
+    thinking_disabled: bool,
     seed_usage: Option<Usage>,
     working_dir: Option<PathBuf>,
     permission_policy: Option<Arc<dyn PermissionPolicy>>,
@@ -251,6 +253,7 @@ impl Default for AgentBuilder {
             max_tokens: 16384,
             temperature: None,
             thinking_budget: None,
+            thinking_disabled: false,
             seed_usage: None,
             working_dir: None,
             permission_policy: None,
@@ -331,6 +334,19 @@ impl AgentBuilder {
 
     pub fn thinking_budget(mut self, tokens: u32) -> Self {
         self.thinking_budget = Some(tokens);
+        self
+    }
+
+    /// Request an *explicit* thinking-off directive (`thinking: {type:
+    /// "disabled"}`) instead of omitting the field. Omission means "model
+    /// default", which is only "off" for models that default that way —
+    /// Anthropic-compatible gateways serving hybrid-reasoning models (e.g.
+    /// Fireworks serving GLM) reason at full tilt unless explicitly disabled.
+    /// Opt-in because some models reject an explicit disable (Claude Fable 5
+    /// returns a 400) — callers know their model; this library doesn't.
+    /// Ignored when a `thinking_budget` is set (the budget wins).
+    pub fn disable_thinking(mut self) -> Self {
+        self.thinking_disabled = true;
         self
     }
 
@@ -470,6 +486,7 @@ impl AgentBuilder {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             thinking_budget: self.thinking_budget,
+            thinking_disabled: self.thinking_disabled,
             working_dir,
             permission_policy: self.permission_policy.unwrap_or_else(|| Arc::new(AllowAll)),
             memory: self.memory,
