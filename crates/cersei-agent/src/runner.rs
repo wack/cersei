@@ -24,6 +24,42 @@ fn rand_jitter() -> u64 {
     seed ^ (seed >> 16) ^ (seed << 7)
 }
 
+/// Sleep out one exponential-backoff step (1s, 2s, 4s, 8s, 16s + jitter) before
+/// re-issuing a failed completion request, telling the UI why.
+async fn retry_backoff(
+    agent: &Agent,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    retry_count: u32,
+    max_retries: u32,
+    err: &CerseiError,
+) {
+    let delay_ms = (1000 * 2u64.pow(retry_count - 1)).min(30_000);
+    let jitter = delay_ms / 4;
+    let actual_delay = delay_ms + (rand_jitter() % jitter.max(1));
+    tracing::warn!(
+        "Provider error (retryable, attempt {}/{}): {}. Retrying in {}ms...",
+        retry_count,
+        max_retries,
+        err,
+        actual_delay
+    );
+    let _ = event_tx
+        .send(AgentEvent::Status(format!(
+            "Provider error. Retrying in {:.1}s... ({}/{})",
+            actual_delay as f64 / 1000.0,
+            retry_count,
+            max_retries
+        )))
+        .await;
+    agent.emit(AgentEvent::Status(format!(
+        "Retrying in {:.1}s ({}/{})",
+        actual_delay as f64 / 1000.0,
+        retry_count,
+        max_retries
+    )));
+    tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
+}
+
 // ─── Tool result size management ─────────────────────────────────────────────
 
 /// Maximum number of lines to keep in a tool result before truncation.
@@ -320,88 +356,82 @@ pub async fn run_agent_streaming(
             })
             .await;
 
-        // Send to provider with automatic retry on transient errors
+        // Send to provider with automatic retry on transient errors. Providers
+        // report failures in-stream (their `complete()` returns before the
+        // request hits the network), so retryable stream errors that arrive
+        // before the provider starts responding are routed back here too and
+        // re-issued with the same backoff.
         let mut retry_count = 0u32;
         const MAX_RETRIES: u32 = 5;
 
-        let (mut rx, mut accumulator) = loop {
+        let accumulator = 'attempt: loop {
             let req_clone = request.clone();
-            match agent.provider.complete(req_clone).await {
-                Ok(stream) => {
-                    break (stream.into_receiver(), StreamAccumulator::new());
-                }
+            let stream = match agent.provider.complete(req_clone).await {
+                Ok(stream) => stream,
                 Err(e) if e.is_retryable() && retry_count < MAX_RETRIES => {
                     retry_count += 1;
-                    let delay_ms = (1000 * 2u64.pow(retry_count - 1)).min(30_000); // 1s, 2s, 4s, 8s, 16s
-                    let jitter = (delay_ms / 4) as u64;
-                    let actual_delay = delay_ms + (rand_jitter() % jitter.max(1));
-                    tracing::warn!(
-                        "Provider error (retryable, attempt {}/{}): {}. Retrying in {}ms...",
-                        retry_count,
-                        MAX_RETRIES,
-                        e,
-                        actual_delay
-                    );
-                    let _ = event_tx
-                        .send(AgentEvent::Status(format!(
-                            "Rate limited. Retrying in {:.1}s... ({}/{})",
-                            actual_delay as f64 / 1000.0,
-                            retry_count,
-                            MAX_RETRIES
-                        )))
-                        .await;
-                    agent.emit(AgentEvent::Status(format!(
-                        "Retrying in {:.1}s ({}/{})",
-                        actual_delay as f64 / 1000.0,
-                        retry_count,
-                        MAX_RETRIES
-                    )));
-                    tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
-                    continue;
+                    retry_backoff(agent, &event_tx, retry_count, MAX_RETRIES, &e).await;
+                    continue 'attempt;
                 }
                 Err(e) => return Err(e),
-            }
-        };
+            };
+            let mut rx = stream.into_receiver();
+            let mut accumulator = StreamAccumulator::new();
 
-        let _ = event_tx
-            .send(AgentEvent::ModelResponseStart {
-                turn,
-                model: model.clone(),
-            })
-            .await;
+            let _ = event_tx
+                .send(AgentEvent::ModelResponseStart {
+                    turn,
+                    model: model.clone(),
+                })
+                .await;
 
-        // Process stream events (with cancellation support)
-        loop {
-            tokio::select! {
-                event = rx.recv() => {
-                    match event {
-                        Some(event) => {
-                            match &event {
-                                StreamEvent::TextDelta { text, .. } => {
-                                    let _ = event_tx.send(AgentEvent::TextDelta(text.clone())).await;
-                                    agent.emit(AgentEvent::TextDelta(text.clone()));
+            // Process stream events (with cancellation support)
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        match event {
+                            Some(event) => {
+                                match &event {
+                                    StreamEvent::TextDelta { text, .. } => {
+                                        let _ = event_tx.send(AgentEvent::TextDelta(text.clone())).await;
+                                        agent.emit(AgentEvent::TextDelta(text.clone()));
+                                    }
+                                    StreamEvent::ThinkingDelta { thinking, .. } => {
+                                        let _ = event_tx
+                                            .send(AgentEvent::ThinkingDelta(thinking.clone()))
+                                            .await;
+                                        agent.emit(AgentEvent::ThinkingDelta(thinking.clone()));
+                                    }
+                                    StreamEvent::Error { message, kind } => {
+                                        let err = kind.into_error(message.clone());
+                                        // Before `message_start`, a stream error is
+                                        // equivalent to `complete()` failing: nothing
+                                        // has been generated or surfaced, so the
+                                        // request can be re-issued wholesale.
+                                        if !accumulator.has_started()
+                                            && err.is_retryable()
+                                            && retry_count < MAX_RETRIES
+                                        {
+                                            retry_count += 1;
+                                            retry_backoff(agent, &event_tx, retry_count, MAX_RETRIES, &err)
+                                                .await;
+                                            continue 'attempt;
+                                        }
+                                        return Err(err);
+                                    }
+                                    _ => {}
                                 }
-                                StreamEvent::ThinkingDelta { thinking, .. } => {
-                                    let _ = event_tx
-                                        .send(AgentEvent::ThinkingDelta(thinking.clone()))
-                                        .await;
-                                    agent.emit(AgentEvent::ThinkingDelta(thinking.clone()));
-                                }
-                                StreamEvent::Error { message } => {
-                                    return Err(CerseiError::Provider(message.clone()));
-                                }
-                                _ => {}
+                                accumulator.process_event(event);
                             }
-                            accumulator.process_event(event);
+                            None => break 'attempt accumulator, // Stream ended
                         }
-                        None => break, // Stream ended
+                    }
+                    _ = agent.cancel_token.cancelled() => {
+                        return Err(CerseiError::Cancelled);
                     }
                 }
-                _ = agent.cancel_token.cancelled() => {
-                    return Err(CerseiError::Cancelled);
-                }
             }
-        }
+        };
 
         // Convert accumulated response
         let response = accumulator.into_response()?;
@@ -1075,5 +1105,122 @@ fn benchmark_check_tests(tool_calls: &[ToolCallRecord]) -> BenchmarkVerification
         BenchmarkVerification::TestsFailed(last_test_output)
     } else {
         BenchmarkVerification::TestsPassed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cersei_provider::{CompletionStream, Provider, ProviderCapabilities};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A provider whose first `failures` `complete()` calls fail in-stream with
+    /// a transport error before `message_start` — the shape reqwest connect
+    /// failures take — and succeed afterwards.
+    struct FlakyProvider {
+        failures: u32,
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl Provider for FlakyProvider {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        fn context_window(&self, _: &str) -> u64 {
+            200_000
+        }
+        fn capabilities(&self, _: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn complete(&self, _: CompletionRequest) -> cersei_types::Result<CompletionStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let fail = call < self.failures;
+            let (tx, rx) = mpsc::channel(16);
+            tokio::spawn(async move {
+                if fail {
+                    let _ = tx
+                        .send(StreamEvent::Error {
+                            message: "error sending request".into(),
+                            kind: StreamErrorKind::Transport,
+                        })
+                        .await;
+                    return;
+                }
+                let _ = tx
+                    .send(StreamEvent::MessageStart {
+                        id: "1".into(),
+                        model: "flaky".into(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        block_type: "text".into(),
+                        id: None,
+                        name: None,
+                    })
+                    .await;
+                let _ = tx
+                    .send(StreamEvent::TextDelta {
+                        index: 0,
+                        text: "recovered".into(),
+                    })
+                    .await;
+                let _ = tx.send(StreamEvent::ContentBlockStop { index: 0 }).await;
+                let _ = tx
+                    .send(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Some(Usage::default()),
+                    })
+                    .await;
+                let _ = tx.send(StreamEvent::MessageStop).await;
+            });
+            Ok(CompletionStream::new(rx))
+        }
+    }
+
+    fn flaky_agent(failures: u32, calls: &Arc<AtomicU32>) -> Agent {
+        Agent::builder()
+            .provider(FlakyProvider {
+                failures,
+                calls: Arc::clone(calls),
+            })
+            .max_turns(2)
+            .build()
+            .expect("agent builds")
+    }
+
+    /// A transport error that arrives before the provider starts responding
+    /// must be re-issued in-place, not surfaced as a run-fatal error.
+    /// (Paused time makes the backoff sleeps instant.)
+    #[tokio::test(start_paused = true)]
+    async fn pre_stream_transport_error_is_retried() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let agent = flaky_agent(2, &calls);
+
+        let output = run_agent(&agent, "hello").await.expect("run succeeds");
+
+        assert_eq!(output.text(), "recovered");
+        // Two failed attempts were re-issued before the one that succeeded.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Once the backoff budget is exhausted, the typed transport error
+    /// surfaces to the caller.
+    #[tokio::test(start_paused = true)]
+    async fn transport_errors_surface_after_retries_exhausted() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let agent = flaky_agent(u32::MAX, &calls);
+
+        let err = run_agent(&agent, "hello").await.expect_err("run fails");
+
+        assert!(matches!(err, CerseiError::Transport(_)), "got: {err:?}");
+        // The initial attempt plus five backoff re-issues.
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
     }
 }

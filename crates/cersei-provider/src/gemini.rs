@@ -30,7 +30,7 @@ impl Gemini {
             api_key: api_key.into(),
             base_url,
             default_model: "gemini-3.1-pro-preview".to_string(),
-            client: reqwest::Client::new(),
+            client: crate::http_client(),
         }
     }
 
@@ -317,6 +317,7 @@ impl Provider for Gemini {
                         let _ = tx
                             .send(StreamEvent::Error {
                                 message: format!("HTTP {}: {}", status, body),
+                                kind: StreamErrorKind::Http { status },
                             })
                             .await;
                         return;
@@ -511,6 +512,7 @@ impl Provider for Gemini {
                                 let _ = tx
                                     .send(StreamEvent::Error {
                                         message: e.to_string(),
+                                        kind: StreamErrorKind::Transport,
                                     })
                                     .await;
                                 return;
@@ -524,6 +526,7 @@ impl Provider for Gemini {
                     let _ = tx
                         .send(StreamEvent::Error {
                             message: e.to_string(),
+                            kind: StreamErrorKind::Transport,
                         })
                         .await;
                 }
@@ -599,7 +602,7 @@ impl GeminiBuilder {
             default_model: self
                 .model
                 .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
-            client: reqwest::Client::new(),
+            client: crate::http_client(),
         })
     }
 }

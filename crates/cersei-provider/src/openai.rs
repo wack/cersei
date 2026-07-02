@@ -24,7 +24,7 @@ impl OpenAi {
             auth,
             base_url,
             default_model: "gpt-4o".to_string(),
-            client: reqwest::Client::new(),
+            client: crate::http_client(),
         }
     }
 
@@ -304,6 +304,7 @@ impl Provider for OpenAi {
                         let _ = tx
                             .send(StreamEvent::Error {
                                 message: format!("HTTP {}: {}", status, body),
+                                kind: StreamErrorKind::Http { status },
                             })
                             .await;
                         return;
@@ -490,6 +491,7 @@ impl Provider for OpenAi {
                                 let _ = tx
                                     .send(StreamEvent::Error {
                                         message: e.to_string(),
+                                        kind: StreamErrorKind::Transport,
                                     })
                                     .await;
                                 return;
@@ -501,6 +503,7 @@ impl Provider for OpenAi {
                     let _ = tx
                         .send(StreamEvent::Error {
                             message: e.to_string(),
+                            kind: StreamErrorKind::Transport,
                         })
                         .await;
                 }
@@ -593,7 +596,7 @@ impl OpenAiBuilder {
             auth,
             base_url: self.base_url.unwrap_or_else(|| OPENAI_API_BASE.to_string()),
             default_model: self.model.unwrap_or_else(|| "gpt-4o".to_string()),
-            client: reqwest::Client::new(),
+            client: crate::http_client(),
         })
     }
 }

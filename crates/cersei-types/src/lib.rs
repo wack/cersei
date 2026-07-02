@@ -289,6 +289,32 @@ pub struct ToolDefinition {
 
 // ─── Stream events ───────────────────────────────────────────────────────────
 
+/// Where a [`StreamEvent::Error`] originated. Providers report all failures
+/// in-stream (their `complete()` returns before the request is sent), so this
+/// is what lets consumers recover the typed [`CerseiError`] — and therefore a
+/// correct retry decision — instead of a stringly-typed `Provider` error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamErrorKind {
+    /// The request failed at the transport layer (connect/TLS/send) — the
+    /// provider never processed it, so re-issuing it is always safe.
+    Transport,
+    /// The provider answered with a non-2xx HTTP status.
+    Http { status: u16 },
+    /// The provider reported an error in-band (e.g. an SSE `error` event).
+    Provider,
+}
+
+impl StreamErrorKind {
+    /// Recover the typed [`CerseiError`] this stream error represents.
+    pub fn into_error(self, message: String) -> CerseiError {
+        match self {
+            StreamErrorKind::Transport => CerseiError::Transport(message),
+            StreamErrorKind::Http { status } => CerseiError::ProviderStatus { status, message },
+            StreamErrorKind::Provider => CerseiError::Provider(message),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     MessageStart {
@@ -338,6 +364,7 @@ pub enum StreamEvent {
     MessageStop,
     Error {
         message: String,
+        kind: StreamErrorKind,
     },
     Ping,
 }
@@ -351,6 +378,11 @@ pub enum CerseiError {
 
     #[error("Provider error {status}: {message}")]
     ProviderStatus { status: u16, message: String },
+
+    /// The request failed at the transport layer (connect/TLS/send) before the
+    /// provider processed it. Always retryable.
+    #[error("Transport error: {0}")]
+    Transport(String),
 
     #[error("Authentication error: {0}")]
     Auth(String),
@@ -391,12 +423,17 @@ pub enum CerseiError {
 
 impl CerseiError {
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            CerseiError::RateLimit { .. }
-                | CerseiError::ProviderStatus { status: 429, .. }
-                | CerseiError::ProviderStatus { status: 529, .. }
-        )
+        match self {
+            // The provider never processed the request — always safe to re-issue.
+            CerseiError::Transport(_) => true,
+            CerseiError::RateLimit { .. } => true,
+            // Rate limiting (429), request timeout (408), and server-side
+            // failures (5xx, which includes Anthropic's 529 "overloaded").
+            CerseiError::ProviderStatus { status, .. } => {
+                matches!(status, 408 | 429) || *status >= 500
+            }
+            _ => false,
+        }
     }
 
     pub fn is_context_limit(&self) -> bool {
@@ -421,4 +458,51 @@ pub struct MemoryEntry {
     pub content: String,
     pub relevance: f32,
     pub source: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_and_server_errors_are_retryable() {
+        assert!(CerseiError::Transport("connection reset".into()).is_retryable());
+        assert!(CerseiError::RateLimit { retry_after: None }.is_retryable());
+        for status in [408, 429, 500, 502, 503, 529] {
+            let err = CerseiError::ProviderStatus {
+                status,
+                message: String::new(),
+            };
+            assert!(err.is_retryable(), "status {status} should be retryable");
+        }
+    }
+
+    #[test]
+    fn client_and_inband_errors_are_not_retryable() {
+        for status in [400, 401, 403, 404, 413] {
+            let err = CerseiError::ProviderStatus {
+                status,
+                message: String::new(),
+            };
+            assert!(!err.is_retryable(), "status {status} should not be retryable");
+        }
+        assert!(!CerseiError::Provider("in-band error".into()).is_retryable());
+        assert!(!CerseiError::Auth("bad key".into()).is_retryable());
+    }
+
+    #[test]
+    fn stream_error_kind_recovers_typed_errors() {
+        assert!(matches!(
+            StreamErrorKind::Transport.into_error("e".into()),
+            CerseiError::Transport(_)
+        ));
+        assert!(matches!(
+            StreamErrorKind::Http { status: 429 }.into_error("e".into()),
+            CerseiError::ProviderStatus { status: 429, .. }
+        ));
+        assert!(matches!(
+            StreamErrorKind::Provider.into_error("e".into()),
+            CerseiError::Provider(_)
+        ));
+    }
 }

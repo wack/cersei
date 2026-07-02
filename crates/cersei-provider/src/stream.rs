@@ -39,6 +39,14 @@ impl StreamAccumulator {
         }
     }
 
+    /// Whether the provider has started responding (a `message_start` event
+    /// has been accumulated). Before this point a stream error is
+    /// indistinguishable from a failed request — nothing has been generated —
+    /// so re-issuing the request is safe.
+    pub fn has_started(&self) -> bool {
+        self.message_id.is_some()
+    }
+
     pub fn process_event(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::MessageStart { id, model } => {

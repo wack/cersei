@@ -66,7 +66,7 @@ impl AnthropicVertex {
             endpoint,
             default_model: "claude-opus-4-8".to_string(),
             thinking_budget: None,
-            client: reqwest::Client::new(),
+            client: crate::http_client(),
         })
     }
 

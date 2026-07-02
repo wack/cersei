@@ -38,7 +38,7 @@ impl Anthropic {
             default_model: "claude-sonnet-4-6".to_string(),
             thinking_budget: None,
             max_retries: 5,
-            client: reqwest::Client::new(),
+            client: crate::http_client(),
         }
     }
 
@@ -213,6 +213,7 @@ pub(crate) fn spawn_sse(client: reqwest::Client, request: reqwest::Request) -> C
                     let _ = tx
                         .send(StreamEvent::Error {
                             message: format!("HTTP {}: {}", status, body),
+                            kind: StreamErrorKind::Http { status },
                         })
                         .await;
                     return;
@@ -234,14 +235,24 @@ pub(crate) fn spawn_sse(client: reqwest::Client, request: reqwest::Request) -> C
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(StreamEvent::Error { message: e.to_string() }).await;
+                            let _ = tx
+                                .send(StreamEvent::Error {
+                                    message: e.to_string(),
+                                    kind: StreamErrorKind::Transport,
+                                })
+                                .await;
                             return;
                         }
                     }
                 }
             }
             Err(e) => {
-                let _ = tx.send(StreamEvent::Error { message: e.to_string() }).await;
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        message: e.to_string(),
+                        kind: StreamErrorKind::Transport,
+                    })
+                    .await;
             }
         }
     });
@@ -344,6 +355,7 @@ fn parse_sse_event(raw: &str) -> Option<StreamEvent> {
                 .as_str()
                 .unwrap_or("Unknown error")
                 .to_string(),
+            kind: StreamErrorKind::Provider,
         }),
         _ => None,
     }
@@ -416,7 +428,7 @@ impl AnthropicBuilder {
                 .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
             thinking_budget: self.thinking_budget,
             max_retries: self.max_retries.unwrap_or(5),
-            client: reqwest::Client::new(),
+            client: crate::http_client(),
         })
     }
 }

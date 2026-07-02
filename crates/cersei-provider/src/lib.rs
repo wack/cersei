@@ -25,6 +25,24 @@ pub use openai::OpenAi;
 pub use router::from_model_string;
 pub use stream::StreamAccumulator;
 
+// ─── HTTP client ─────────────────────────────────────────────────────────────
+
+/// Connect timeout for provider HTTP clients. Streaming responses legitimately
+/// run for minutes, so only the *connection* phase is bounded — a doomed
+/// connect should fail (and get retried) in seconds, not stall an agent turn.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Build the HTTP client shared by the providers: bounded connect, no
+/// total-request timeout (streams are long-lived).
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        // Building only fails if the TLS backend cannot initialize; fall back
+        // to the default client rather than panicking.
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 // ─── Provider trait ──────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -207,8 +225,8 @@ impl CompletionStream {
     pub async fn collect(mut self) -> Result<CompletionResponse> {
         let mut acc = StreamAccumulator::new();
         while let Some(event) = self.rx.recv().await {
-            if let StreamEvent::Error { message } = &event {
-                return Err(CerseiError::Provider(message.clone()));
+            if let StreamEvent::Error { message, kind } = &event {
+                return Err(kind.into_error(message.clone()));
             }
             acc.process_event(event);
         }
