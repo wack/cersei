@@ -484,7 +484,10 @@ mod tests {
                 status,
                 message: String::new(),
             };
-            assert!(!err.is_retryable(), "status {status} should not be retryable");
+            assert!(
+                !err.is_retryable(),
+                "status {status} should not be retryable"
+            );
         }
         assert!(!CerseiError::Provider("in-band error".into()).is_retryable());
         assert!(!CerseiError::Auth("bad key".into()).is_retryable());
