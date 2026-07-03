@@ -195,6 +195,40 @@ impl WorkflowBuilder {
         self.loop_step(step_id, crate::ir::LoopMode::DoUntil, condition)
     }
 
+    /// Map a single-step body over an input array with bounded `concurrency`
+    /// (Mastra `.foreach`). The step runs once per array element; the workflow
+    /// output is the array of per-element results, in input order.
+    ///
+    /// Unlike [`Self::loop_step`], the `Loop` node is appended *before* its body
+    /// node so that when `foreach` is the first builder call the loop — not the
+    /// body — becomes the workflow entry. (Entry binds to the first pushed node;
+    /// a body-first entry would start execution inside the loop with the whole
+    /// array as one item.)
+    pub fn foreach(mut self, step_id: &str, concurrency: usize) -> Self {
+        let body_id = self.next_id(step_id);
+        let loop_id = self.next_id("loop");
+        self.append(
+            loop_id.clone(),
+            NodeKind::Loop {
+                mode: crate::ir::LoopMode::ForEach { concurrency },
+                body: body_id.clone(),
+                condition: None,
+            },
+        );
+        self.push_node(
+            body_id.clone(),
+            NodeKind::Step {
+                step_id: step_id.to_string(),
+                config: Value::Null,
+            },
+        );
+        // The body's tail loops back to the loop node.
+        self.edges
+            .push(WorkflowEdge::new(body_id, loop_id.clone(), EdgeKind::LoopBack));
+        self.cursor = Some(loop_id);
+        self
+    }
+
     /// Finalize into the IR.
     pub fn commit(self) -> WorkflowDef {
         WorkflowDef {

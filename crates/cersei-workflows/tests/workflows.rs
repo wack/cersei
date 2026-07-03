@@ -233,6 +233,95 @@ async fn suspend_then_resume_completes() {
     );
 }
 
+// ─── 8b. ForEach maps a body over an array with a bounded, honored cap ─────────
+
+#[tokio::test]
+async fn foreach_bounds_concurrency_and_preserves_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const N: usize = 6;
+    const LIMIT: usize = 3;
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+
+    let reg = StepRegistry::new();
+    {
+        let in_flight = Arc::clone(&in_flight);
+        let max_seen = Arc::clone(&max_seen);
+        reg.register(Arc::new(FnStep::new("double", move |input: Value, _ctx| {
+            let in_flight = Arc::clone(&in_flight);
+            let max_seen = Arc::clone(&max_seen);
+            async move {
+                // Record peak concurrency while parked here.
+                let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(cur, Ordering::SeqCst);
+                // Yield repeatedly so peers get scheduled and the buffer fills.
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let n = input.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
+                Ok(json!({ "doubled": n * 2 }))
+            }
+        })));
+    }
+
+    let def = WorkflowBuilder::new("fan")
+        .foreach("double", LIMIT)
+        .commit();
+    // `foreach` as the first (only) node must be the entry, not its body.
+    assert!(def.entry.starts_with("loop"), "entry was {}", def.entry);
+    let wf = Workflow::compile(def, &reg).unwrap();
+
+    let items: Vec<Value> = (0..N).map(|n| json!({ "n": n })).collect();
+    let result = wf.start(json!(items)).await.unwrap();
+    assert_eq!(result.status, RunStatus::Success);
+
+    // Output preserves input order despite out-of-order completion.
+    let arr = result.result.unwrap();
+    let doubled: Vec<u64> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.get("doubled").and_then(|d| d.as_u64()).unwrap())
+        .collect();
+    assert_eq!(doubled, (0..N as u64).map(|n| n * 2).collect::<Vec<_>>());
+
+    // The cap was honored (never more than LIMIT at once) yet genuine
+    // concurrency happened (more than one ran simultaneously).
+    let peak = max_seen.load(Ordering::SeqCst);
+    assert!(peak <= LIMIT, "concurrency {peak} exceeded cap {LIMIT}");
+    assert!(peak >= 2, "foreach ran sequentially (peak {peak})");
+}
+
+// ─── 8c. ForEach with cap 1 runs sequentially but still maps in order ─────────
+
+#[tokio::test]
+async fn foreach_with_unit_cap_runs_in_order() {
+    let reg = StepRegistry::new();
+    reg.register(Arc::new(FnStep::new("double", |input: Value, _ctx| async move {
+        let n = input.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
+        Ok(json!({ "doubled": n * 2 }))
+    })));
+
+    let def = WorkflowBuilder::new("seq").foreach("double", 1).commit();
+    let wf = Workflow::compile(def, &reg).unwrap();
+
+    let items: Vec<Value> = (0..4).map(|n| json!({ "n": n })).collect();
+    let result = wf.start(json!(items)).await.unwrap();
+    assert_eq!(result.status, RunStatus::Success);
+    let doubled: Vec<u64> = result
+        .result
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.get("doubled").and_then(|d| d.as_u64()).unwrap())
+        .collect();
+    assert_eq!(doubled, vec![0, 2, 4, 6]);
+}
+
 // ─── 8. Unknown step id fails compilation ─────────────────────────────────────
 
 #[test]

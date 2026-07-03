@@ -18,6 +18,7 @@ use crate::store::RunSnapshot;
 use cersei_tools::Extensions;
 use cersei_types::{CerseiError, Result};
 use dashmap::DashMap;
+use futures::stream::StreamExt;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -483,20 +484,35 @@ impl Workflow {
         let body_nodes = self.reachable(body, node_id);
 
         let output = match mode {
-            LoopMode::ForEach { .. } => {
+            LoopMode::ForEach { concurrency } => {
                 let items = match &input {
                     Value::Array(a) => a.clone(),
                     _ => return Err(CerseiError::Config("foreach input is not an array".into())),
                 };
-                let mut collected = Vec::with_capacity(items.len());
-                for item in items {
-                    self.clear_nodes(rctx, &body_nodes);
-                    match self.walk(rctx, body, item, Some(node_id)).await? {
-                        Some(v) => collected.push(v),
+                let limit = (*concurrency).max(1);
+                if limit == 1 {
+                    // Sequential path: a single shared `outputs` cache with
+                    // `clear_nodes` between iterations. Preserves suspend/resume
+                    // (the resume target lives in this cache) and is the only path
+                    // that can suspend, so it stays byte-for-byte as it was.
+                    let mut collected = Vec::with_capacity(items.len());
+                    for item in items {
+                        self.clear_nodes(rctx, &body_nodes);
+                        match self.walk(rctx, body, item, Some(node_id)).await? {
+                            Some(v) => collected.push(v),
+                            None => return Ok(None),
+                        }
+                    }
+                    Value::Array(collected)
+                } else {
+                    match self
+                        .exec_foreach_concurrent(rctx, node_id, body, &body_nodes, items, limit)
+                        .await?
+                    {
+                        Some(v) => v,
                         None => return Ok(None),
                     }
                 }
-                Value::Array(collected)
             }
             LoopMode::DoWhile | LoopMode::DoUntil => {
                 let mut acc = input;
@@ -532,6 +548,94 @@ impl Workflow {
 
         rctx.outputs.insert(node_id.to_string(), output.clone());
         self.continue_from(rctx, node_id, output, stop_at).await
+    }
+
+    /// Run a `ForEach` body over `items` with bounded concurrency (`limit > 1`).
+    ///
+    /// Each iteration gets its **own** `RunCtx` so that concurrent iterations
+    /// never share memo entries: the body reuses the same node ids every time, so
+    /// a single shared `outputs` cache (as the sequential path uses) would let one
+    /// iteration read another's cached output — or short-circuit it entirely. The
+    /// child ctx shares `state` / `events` / `extensions` with the parent (so
+    /// steps still see run state and stream events) but carries a private
+    /// `outputs` snapshot seeded from the parent's pre-loop outputs (minus the
+    /// body nodes — the concurrent analogue of `clear_nodes`).
+    ///
+    /// Results are gathered out of order and sorted by input index so the output
+    /// array preserves input order. A child error aborts the whole loop (matching
+    /// the sequential `?`); a child suspend surfaces as a run suspension. Resume
+    /// is unsupported here — callers that need suspend/resume use `concurrency: 1`.
+    async fn exec_foreach_concurrent(
+        &self,
+        rctx: &RunCtx,
+        node_id: &str,
+        body: &str,
+        body_nodes: &HashSet<NodeId>,
+        items: Vec<Value>,
+        limit: usize,
+    ) -> Result<Option<Value>> {
+        let base_outputs: Vec<(NodeId, Value)> = rctx
+            .outputs
+            .iter()
+            .filter(|e| !body_nodes.contains(e.key()))
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+
+        let mut stream = futures::stream::iter(items.into_iter().enumerate())
+            .map(|(idx, item)| {
+                let base_outputs = base_outputs.clone();
+                async move {
+                    let child = RunCtx {
+                        run_id: rctx.run_id.clone(),
+                        input: rctx.input.clone(),
+                        state: Arc::clone(&rctx.state),
+                        outputs: base_outputs.into_iter().collect(),
+                        results: DashMap::new(),
+                        events: rctx.events.clone(),
+                        extensions: rctx.extensions.clone(),
+                        resume: None,
+                        suspend: Mutex::new(None),
+                    };
+                    let walked = self.walk(&child, body, item, Some(node_id)).await;
+                    // Drain the child's per-node results and suspend point before
+                    // the ctx drops so they can be merged into the parent.
+                    let results: Vec<(NodeId, StepResult)> = child
+                        .results
+                        .iter()
+                        .map(|e| (e.key().clone(), e.value().clone()))
+                        .collect();
+                    let suspend = child.suspend.lock().take();
+                    (idx, walked, results, suspend)
+                }
+            })
+            .buffer_unordered(limit);
+
+        let mut gathered: Vec<(usize, Value)> = Vec::new();
+        let mut suspended: Option<SuspendPoint> = None;
+        while let Some((idx, walked, results, suspend)) = stream.next().await {
+            for (k, v) in results {
+                rctx.results.insert(k, v);
+            }
+            match walked {
+                Ok(Some(v)) => gathered.push((idx, v)),
+                Ok(None) => {
+                    if suspended.is_none() {
+                        suspended = suspend;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if let Some(sp) = suspended {
+            *rctx.suspend.lock() = Some(sp);
+            return Ok(None);
+        }
+
+        gathered.sort_by_key(|(idx, _)| *idx);
+        Ok(Some(Value::Array(
+            gathered.into_iter().map(|(_, v)| v).collect(),
+        )))
     }
 
     /// Follow the single `Then` successor, if any.
