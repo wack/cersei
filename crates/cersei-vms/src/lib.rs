@@ -4,7 +4,8 @@
 //!
 //! Provides a pluggable [`SandboxRuntime`] trait, several backends
 //! ([`LocalProcessRuntime`], [`DockerRuntime`], `SpritesRuntime` behind the
-//! `backend-sprites` feature), three host-mediated
+//! `backend-sprites` feature, `VercelRuntime` behind the `backend-vercel`
+//! feature), three host-mediated
 //! cross-sandbox primitives ([`Volume`](primitives::Volume),
 //! [`Mailbox`](primitives::Mailbox), [`KvStore`](primitives::KvStore)),
 //! and a snapshot/restore subsystem.
@@ -27,6 +28,8 @@ pub use backends::LocalProcessRuntime;
 pub use backends::DockerRuntime;
 #[cfg(feature = "backend-sprites")]
 pub use backends::SpritesRuntime;
+#[cfg(feature = "backend-vercel")]
+pub use backends::{VercelConfig, VercelRuntime};
 
 pub use commands::{CommandStream, Commands, StreamChunk};
 pub use error::{Result, VmError};
@@ -55,5 +58,7 @@ pub mod prelude {
     pub use crate::DockerRuntime;
     #[cfg(feature = "backend-sprites")]
     pub use crate::SpritesRuntime;
+    #[cfg(feature = "backend-vercel")]
+    pub use crate::{VercelConfig, VercelRuntime};
     pub use crate::LocalProcessRuntime;
 }
