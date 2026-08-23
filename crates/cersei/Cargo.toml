@@ -44,6 +44,8 @@ futures = { workspace = true }
 [features]
 default = ["vms"]
 vms = ["dep:cersei-vms", "cersei-tools/vms"]
+# Sprites.dev (Fly.io) remote sandbox backend for cersei-vms.
+vms-sprites = ["vms", "cersei-vms/backend-sprites"]
 # AgentTemplate DSL — the programmable sub-agent language.
 agentlang = ["dep:cersei-agentlang"]
 # AgentRL — the self-evolving orchestration layer (pulls in agentlang + vms).

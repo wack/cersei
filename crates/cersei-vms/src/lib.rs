@@ -3,7 +3,8 @@
 //! Sandbox & VM isolation for the Cersei coding-agent SDK.
 //!
 //! Provides a pluggable [`SandboxRuntime`] trait, several backends
-//! ([`LocalProcessRuntime`], [`DockerRuntime`]), three host-mediated
+//! ([`LocalProcessRuntime`], [`DockerRuntime`], `SpritesRuntime` behind the
+//! `backend-sprites` feature), three host-mediated
 //! cross-sandbox primitives ([`Volume`](primitives::Volume),
 //! [`Mailbox`](primitives::Mailbox), [`KvStore`](primitives::KvStore)),
 //! and a snapshot/restore subsystem.
@@ -24,6 +25,8 @@ pub mod types;
 pub use backends::LocalProcessRuntime;
 #[cfg(feature = "backend-docker")]
 pub use backends::DockerRuntime;
+#[cfg(feature = "backend-sprites")]
+pub use backends::SpritesRuntime;
 
 pub use commands::{CommandStream, Commands, StreamChunk};
 pub use error::{Result, VmError};
@@ -50,5 +53,7 @@ pub mod prelude {
     };
     #[cfg(feature = "backend-docker")]
     pub use crate::DockerRuntime;
+    #[cfg(feature = "backend-sprites")]
+    pub use crate::SpritesRuntime;
     pub use crate::LocalProcessRuntime;
 }

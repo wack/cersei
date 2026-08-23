@@ -93,6 +93,9 @@ html2text = "0.12"
 # Process execution
 nix = { version = "0.29", features = ["process", "signal", "user"] }
 
+# Sandboxing backends
+sprites = "0.1"
+
 # JSON Schema
 schemars = { version = "0.8", features = ["derive"] }
 
