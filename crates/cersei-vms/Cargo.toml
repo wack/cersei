@@ -24,12 +24,17 @@ required-features = ["envd"]
 name = "sprites_sandbox"
 required-features = ["backend-sprites"]
 
+[[example]]
+name = "vercel_sandbox"
+required-features = ["backend-vercel"]
+
 [features]
 default = ["backend-docker", "envd"]
 backend-docker = []
 backend-firecracker = []
 backend-e2b = []
 backend-sprites = ["dep:sprites"]
+backend-vercel = ["dep:reqwest", "dep:tar", "dep:flate2"]
 envd = ["dep:tracing-subscriber"]
 
 [dependencies]
@@ -55,6 +60,10 @@ dirs.workspace = true
 tempfile.workspace = true
 nix.workspace = true
 sprites = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+http = "1"

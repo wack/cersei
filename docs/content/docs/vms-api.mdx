@@ -24,6 +24,7 @@ use cersei_vms::prelude::*;
 | `backend-firecracker` |   | Reserved — Phase 2 Linux microVM backend. |
 | `backend-e2b` |   | Reserved — Phase 2 remote E2B backend. |
 | `backend-sprites` |   | `SpritesRuntime` — remote sandboxes on [Sprites.dev](https://sprites.dev) (Fly.io) via the official `sprites` SDK. |
+| `backend-vercel` |   | `VercelRuntime` — remote Firecracker microVMs on [Vercel Sandbox](https://vercel.com/docs/sandbox) via a built-in `reqwest` client. |
 | `envd` | ✅ | Builds the `cersei-envd` binary target. |
 
 The corresponding `cersei` facade flag is `vms` (default-on), which in turn enables the `vms` feature on `cersei-tools` and re-exports the crate as `cersei::vms`.
@@ -70,6 +71,7 @@ pub struct RuntimeCaps {
 | `LocalProcessRuntime` | ✅ | ❌ | ❌ | ✅ | ❌ |
 | `DockerRuntime` | ✅ | ❌¹ | ✅ | ✅ | ❌ |
 | `SpritesRuntime` | ✅ | ❌² | ✅ | ❌ | ✅ |
+| `VercelRuntime` | ✅ | ✅ | ✅ | ❌ | ✅ |
 
 ¹ Phase 1 leaves `pause_resume` off on Docker. It's a one-line wrap of `docker pause` / `unpause`, lands in 0.1.10.
 
@@ -77,7 +79,7 @@ pub struct RuntimeCaps {
 
 ### Backends
 
-<Tabs items={['LocalProcessRuntime', 'DockerRuntime', 'SpritesRuntime']}>
+<Tabs items={['LocalProcessRuntime', 'DockerRuntime', 'SpritesRuntime', 'VercelRuntime']}>
 <Tab value="LocalProcessRuntime">
 
 No real isolation — spawns plain `tokio::process` children of the host. Each sandbox owns a directory under `~/.cersei/vms/local/<sandbox_id>/rootfs/`. `/foo/bar` paths inside the sandbox resolve to `<root>/rootfs/foo/bar` on the host.
@@ -144,6 +146,43 @@ Backend-specific notes:
 - Volume mounts are rejected at `create()` (`shared_volumes: false`).
 - Checkpoints restore **in place**: `restore()` re-attaches to the sprite the snapshot was taken from rather than cloning a fresh one.
 - `get()` falls back to attaching by sprite name server-side, and `list()` queries the API with the `cersei-vm-` prefix, so sandboxes created by other processes are visible.
+
+</Tab>
+<Tab value="VercelRuntime">
+
+Remote isolation on [Vercel Sandbox](https://vercel.com/docs/sandbox) — Firecracker microVMs with persistent filesystems, snapshots, and pause/resume. Vercel ships no official Rust SDK, so this backend embeds a minimal `reqwest` client speaking the same REST API as the official `@vercel/sandbox` JS SDK. Behind the off-by-default `backend-vercel` feature.
+
+```rust
+let rt = VercelRuntime::from_env()?; // VERCEL_TOKEN / VERCEL_TEAM_ID / VERCEL_PROJECT_ID
+let rt = VercelRuntime::new(
+    VercelConfig::new(token, project_id)
+        .with_team_id(team_id)
+        .with_sandbox_timeout_ms(600_000),
+)?;
+```
+
+Lifecycle mapping:
+
+| Trait method | REST call |
+|---|---|
+| `create()` | `POST /v3/sandboxes` (`cpu_limit` → `resources.vcpus`, `env`/`labels` → `env`/`tags`) |
+| `Commands::run()` / `stream()` | `POST /v2/sandboxes/sessions/<sid>/cmd` with `wait: true, logs: true` (ND-JSON stream) |
+| `Filesystem::read` | `POST …/fs/read` (octet-stream) |
+| `Filesystem::write` | `POST …/fs/write` (gzipped tar extracted at `x-cwd`) |
+| `Filesystem::mkdir(recursive)` | `POST …/fs/mkdir` |
+| `Filesystem::list/stat/remove` | shell commands, as in the docker backend |
+| `snapshot()` | `POST …/sessions/<sid>/snapshot` + JSON manifest |
+| `restore(&snap)` | `POST /v3/sandboxes` with `source: { type: "snapshot" }` — a fresh sandbox from the snapshot |
+| `pause()` / `resume()` | `POST …/sessions/<sid>/stop` / `GET /v2/sandboxes/<name>?resume=true` (session id rotates) |
+| `kill()` | stop session + `DELETE /v2/sandboxes/<name>` |
+
+Backend-specific notes:
+
+- Auth is the access-token flow: a Vercel access token plus team and project ids.
+- `SandboxOpts::image` is forwarded only when it differs from the Cersei default; custom images must be Vercel managed images or live in Vercel Container Registry.
+- `mem_limit` is ignored — Vercel scales memory with vCPUs.
+- Volume mounts are rejected at `create()` (`shared_volumes: false`).
+- `get()` falls back to attaching by sandbox name server-side, and `list()` queries the API with the `cersei-vm-` prefix.
 
 </Tab>
 </Tabs>
