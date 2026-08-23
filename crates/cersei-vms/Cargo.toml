@@ -20,11 +20,16 @@ name = "cersei-envd"
 path = "src/bin/cersei_envd.rs"
 required-features = ["envd"]
 
+[[example]]
+name = "sprites_sandbox"
+required-features = ["backend-sprites"]
+
 [features]
 default = ["backend-docker", "envd"]
 backend-docker = []
 backend-firecracker = []
 backend-e2b = []
+backend-sprites = ["dep:sprites"]
 envd = ["dep:tracing-subscriber"]
 
 [dependencies]
@@ -49,6 +54,7 @@ base64.workspace = true
 dirs.workspace = true
 tempfile.workspace = true
 nix.workspace = true
+sprites = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

@@ -23,6 +23,7 @@ use cersei_vms::prelude::*;
 | `backend-docker` | ✅ | `DockerRuntime` and the per-container shell-out logic. |
 | `backend-firecracker` |   | Reserved — Phase 2 Linux microVM backend. |
 | `backend-e2b` |   | Reserved — Phase 2 remote E2B backend. |
+| `backend-sprites` |   | `SpritesRuntime` — remote sandboxes on [Sprites.dev](https://sprites.dev) (Fly.io) via the official `sprites` SDK. |
 | `envd` | ✅ | Builds the `cersei-envd` binary target. |
 
 The corresponding `cersei` facade flag is `vms` (default-on), which in turn enables the `vms` feature on `cersei-tools` and re-exports the crate as `cersei::vms`.
@@ -68,12 +69,15 @@ pub struct RuntimeCaps {
 |---|:-:|:-:|:-:|:-:|:-:|
 | `LocalProcessRuntime` | ✅ | ❌ | ❌ | ✅ | ❌ |
 | `DockerRuntime` | ✅ | ❌¹ | ✅ | ✅ | ❌ |
+| `SpritesRuntime` | ✅ | ❌² | ✅ | ❌ | ✅ |
 
 ¹ Phase 1 leaves `pause_resume` off on Docker. It's a one-line wrap of `docker pause` / `unpause`, lands in 0.1.10.
 
+² Sprites hibernate automatically when idle (and wake on the next exec), so explicit pause/resume is unnecessary.
+
 ### Backends
 
-<Tabs items={['LocalProcessRuntime', 'DockerRuntime']}>
+<Tabs items={['LocalProcessRuntime', 'DockerRuntime', 'SpritesRuntime']}>
 <Tab value="LocalProcessRuntime">
 
 No real isolation — spawns plain `tokio::process` children of the host. Each sandbox owns a directory under `~/.cersei/vms/local/<sandbox_id>/rootfs/`. `/foo/bar` paths inside the sandbox resolve to `<root>/rootfs/foo/bar` on the host.
@@ -108,6 +112,38 @@ Lifecycle mapping:
 | `restore(&snap)` | `create()` with the snapshot image tag |
 | `pause()` / `resume()` | **Phase 2** (`docker pause`/`unpause`) |
 | `kill()` | `docker rm -f <name>` |
+
+</Tab>
+<Tab value="SpritesRuntime">
+
+Remote isolation on [Sprites.dev](https://sprites.dev), Fly.io's sandbox product, through the official [`sprites`](https://docs.rs/sprites) Rust SDK. Each Cersei sandbox maps 1:1 to a sprite — an isolated remote VM with a persistent filesystem, checkpoint/restore, and per-domain network policy. Behind the off-by-default `backend-sprites` feature.
+
+```rust
+let rt = SpritesRuntime::new(token)?;                       // api.sprites.dev
+let rt = SpritesRuntime::with_base_url(token, url)?;        // custom endpoint
+let rt = SpritesRuntime::from_env()?;                       // SPRITES_TOKEN / SPRITES_BASE_URL
+let rt = SpritesRuntime::with_client(client)?;              // pre-configured SpritesClient
+```
+
+Lifecycle mapping:
+
+| Trait method | sprites SDK call |
+|---|---|
+| `create()` | `client.create_with_config("cersei-vm-<id>", …)` (`cpu_limit` → `cpus`, `mem_limit` → `ram_mb`) |
+| `Commands::run()` | `sprite.command("/bin/sh").arg("-c").arg(cmd).output()` over the exec WebSocket |
+| `Commands::stream()` | `spawn()` + chunked stdout/stderr forwarding |
+| `Filesystem::*` | `read_file` / `write_file` / `read_dir` / `stat` / `mkdir[_all]` / `remove[_all]` |
+| `snapshot()` | `sprite.checkpoint(…)` + JSON manifest |
+| `restore(&snap)` | re-attach to the source sprite, `sprite.restore(checkpoint_id)` |
+| `kill()` | `sprite.destroy()` |
+
+Backend-specific notes:
+
+- Sprites boot from a fixed base image — `SandboxOpts::image` is ignored.
+- `SandboxOpts::env` is injected per-command (the create API takes no env).
+- Volume mounts are rejected at `create()` (`shared_volumes: false`).
+- Checkpoints restore **in place**: `restore()` re-attaches to the sprite the snapshot was taken from rather than cloning a fresh one.
+- `get()` falls back to attaching by sprite name server-side, and `list()` queries the API with the `cersei-vm-` prefix, so sandboxes created by other processes are visible.
 
 </Tab>
 </Tabs>
